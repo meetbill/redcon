@@ -1106,12 +1106,16 @@ type PubSub struct {
 
 // Subscribe a connection to PubSub
 func (ps *PubSub) Subscribe(conn Conn, channel string) {
-	ps.subscribe(conn, false, channel)
+	ps.subscribe(conn, false, channel, true, "v2")
+}
+
+func (ps *PubSub) SubscribeCustom(conn Conn, channel string, outputMessage bool, pingVersion string) {
+	ps.subscribe(conn, false, channel, outputMessage, pingVersion)
 }
 
 // Psubscribe a connection to PubSub
 func (ps *PubSub) Psubscribe(conn Conn, channel string) {
-	ps.subscribe(conn, true, channel)
+	ps.subscribe(conn, true, channel, true, "v2")
 }
 
 // Publish a message to subscribers
@@ -1183,7 +1187,7 @@ func (sconn *pubSubConn) writeMessage(pat bool, pchan, channel, msg string) {
 
 // bgrunner runs in the background and reads incoming commands from the
 // detached client.
-func (sconn *pubSubConn) bgrunner(ps *PubSub) {
+func (sconn *pubSubConn) bgrunner(ps *PubSub, pingVersion string) {
 	defer func() {
 		// client connection has ended, disconnect from the PubSub instances
 		// and close the network connection.
@@ -1245,6 +1249,28 @@ func (sconn *pubSubConn) bgrunner(ps *PubSub) {
 			}()
 			return
 		case "ping":
+			if pingVersion == "v1" {
+				switch len(cmd.Args) {
+				case 1:
+				default:
+					func() {
+						sconn.mu.Lock()
+						defer sconn.mu.Unlock()
+						sconn.dconn.WriteError(fmt.Sprintf("ERR wrong number of "+
+							"arguments for '%s'", cmd.Args[0]))
+						sconn.dconn.Flush()
+					}()
+					continue
+				}
+				func() {
+					sconn.mu.Lock()
+					defer sconn.mu.Unlock()
+					sconn.dconn.WriteString("PONG")
+					sconn.dconn.Flush()
+				}()
+				continue
+			}
+			// v2
 			var msg string
 			switch len(cmd.Args) {
 			case 1:
@@ -1310,7 +1336,11 @@ func byEntry(a, b interface{}) bool {
 	return aid < bid
 }
 
-func (ps *PubSub) subscribe(conn Conn, pattern bool, channel string) {
+/*
+ * outputMessage: 如果为 false ，则不输出订阅 channel 信息, 方便其他场景复用
+ * pingversion: v1:ping -> PONG, v2: ping -> pong, ""
+ */
+func (ps *PubSub) subscribe(conn Conn, pattern bool, channel string, outputMessage bool, pingVersion string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 
@@ -1349,25 +1379,27 @@ func (ps *PubSub) subscribe(conn Conn, pattern bool, channel string) {
 	sconn.entries[entry] = true
 
 	// send a message to the client
-	sconn.dconn.WriteArray(3)
-	if pattern {
-		sconn.dconn.WriteBulkString("psubscribe")
-	} else {
-		sconn.dconn.WriteBulkString("subscribe")
-	}
-	sconn.dconn.WriteBulkString(channel)
-	var count int
-	for entry := range sconn.entries {
-		if entry.pattern == pattern {
-			count++
+	if outputMessage {
+		sconn.dconn.WriteArray(3)
+		if pattern {
+			sconn.dconn.WriteBulkString("psubscribe")
+		} else {
+			sconn.dconn.WriteBulkString("subscribe")
 		}
+		sconn.dconn.WriteBulkString(channel)
+		var count int
+		for entry := range sconn.entries {
+			if entry.pattern == pattern {
+				count++
+			}
+		}
+		sconn.dconn.WriteInt(count)
+		sconn.dconn.Flush()
 	}
-	sconn.dconn.WriteInt(count)
-	sconn.dconn.Flush()
 
 	// start the background client operation
 	if !ok {
-		go sconn.bgrunner(ps)
+		go sconn.bgrunner(ps, pingVersion)
 	}
 }
 
